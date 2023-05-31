@@ -1,0 +1,257 @@
+function CGsim(fname)
+mrstModule add ad-core ad-blackoil deckformat ...
+    agglom upscaling coarsegrid book ...
+    mrst-gui ad-props incomp optimization...
+    network-models test-suite linearsolvers
+
+
+%fname='caseInput.txt';
+%!!important note!! make sure array dimension for pv, perm consisten with
+%active cell num in coarse grid
+
+
+file = fullfile(getcurrentdir,fname);
+fileID = fopen(file);
+
+deck=textscan(fileID, '%s');
+deck=deck{:};
+fclose(fileID);
+
+%% #############------------ ADD PARAMETER ------------##################
+%nParams = 9;
+
+ind_tTrain=find(contains(deck,'tTrain'));
+tTrain = deck((ind_tTrain(1)+1));
+tTrain = cellfun(@(a)str2double(a), tTrain);
+
+ind_tRun=find(contains(deck,'tRun'));
+tRun = deck((ind_tRun(1)+1));
+tRun = cellfun(@(a)str2double(a), tRun);
+
+ind_grid=find(contains(deck,'grid'));
+ind_nw=find(contains(deck,'nw'));
+ind_ng=find(contains(deck,'ng'));
+ind_kw=find(contains(deck,'kw'));
+ind_kg=find(contains(deck,'kg'));
+ind_srw=find(contains(deck,'srw'));
+ind_wi=find(contains(deck,'wi'));
+ind_pv=find(contains(deck,'pv'));
+ind_permIJ=find(contains(deck,'permIJ'));
+ind_permK=find(contains(deck,'permK'));
+
+gsize=deck((ind_grid(1)+1):(ind_grid(2)-1));
+gsize=cellfun(@(a)str2double(a), gsize);
+
+nw=vertcat(deck{ind_nw(1)+1:ind_nw(2)-1});
+nw=str2num(nw);
+
+ng=vertcat(deck{ind_ng(1)+1:ind_ng(2)-1});
+ng=str2num(ng);
+
+kw=vertcat(deck{ind_kw(1)+1:ind_kw(2)-1});
+kw=str2num(kw);
+
+kg=vertcat(deck{ind_kg(1)+1:ind_kg(2)-1});
+kg=str2num(kg);
+
+srw=vertcat(deck{ind_srw(1)+1:ind_srw(2)-1});
+srw=str2num(srw);
+
+wi=deck((ind_wi(1)+1):(ind_wi(2)-1));
+wi=cellfun(@(a)str2double(a), wi);
+
+pv=deck((ind_pv(1)+1):(ind_pv(2)-1));
+pv=cellfun(@(a)str2double(a), pv);
+
+permIJ=deck((ind_permIJ(1)+1):(ind_permIJ(2)-1));
+permIJ=cellfun(@(a)str2double(a), permIJ);
+
+permK=deck((ind_permK(1)+1):(ind_permK(2)-1));
+permK=cellfun(@(a)str2double(a), permK);
+
+
+%% ############--------LOAD PRECOMPUTED DATA-------------##################
+
+load('fullmodel.mat','model')
+load('well.mat','W')
+load('initState.mat','initState')
+
+
+% CG NET MODEL SETUP
+
+%statesObs=statesFull(1:tTrain);
+%predStates=statesObs; %training data
+
+NI = gsize(1);
+NJ = NI;
+NK = gsize(3);
+
+q = processPartition(model.G, partitionUI(model.G,[NI NJ NK]));
+q = compressPartition(q);
+cModel = upscaleModelTPFA(model, q,'transFromRock',false);
+
+% tighter tolerance to improve gradient accuracy
+cModel.toleranceCNV = 1e-6;
+
+%upscaling of initial condition
+cState0 = upscaleState(cModel, model, initState);
+
+%% upscaling schedule
+[schedule_obs.control, schedule_full.control]    = deal(struct('W', W));  %training data
+
+schedule_obs.step.val = repmat(year, tTrain, 1);
+schedule_obs.step.control = ones(tTrain, 1);
+
+schedule_full.step.val = repmat(year, tRun, 1);
+schedule_full.step.control = ones(tRun, 1);
+
+
+cPredSched  = upscaleSchedule(cModel, schedule_obs);
+cFullSched  = upscaleSchedule(cModel, schedule_full);
+
+%% update of model parameter
+%---(1) permIJ
+assert(size(permIJ,1)==size(cModel.rock.perm(:,1),1),'permIJ dimension mismatch')
+
+cModel.rock.perm(:,1) =permIJ;
+cModel.rock.perm(:,2) =permIJ;
+
+%---(2) permK
+assert(size(permK,1)==size(cModel.rock.perm(:,3),1),'permK dimension mismatch')
+
+cModel.rock.perm(:,3) =permK;
+
+%---(3) relperm
+%reservoir RTYPE
+satnumC=ones(cModel.G.cells.num,1); %RT 1 for reservoir
+
+wellName=['P1';'P2';'P3'];
+
+for i=1:length(wellName)
+
+    ind = find(strcmp({cPredSched.control.W.name}, wellName(i,:))==1);
+    ind = cPredSched.control.W(ind).cells;
+    satnumC(ind)=i+1;
+end
+
+rtype=numel(unique(satnumC));
+
+cModel.rock.regions = struct('saturation', satnumC);
+%Brooks-Corey function update
+cModel.fluid.nW=nw;
+cModel.fluid.nG=ng;
+cModel.fluid.srW=srw;
+cModel.fluid.kW=kw;
+cModel.fluid.kG=kg;
+
+[kRw,kRg]=deal(cell([1,rtype]));
+
+for i=1:rtype
+    kRw{i}=coreyPhaseRelpermAD(cModel.fluid.nW(i), cModel.fluid.srW(i), cModel.fluid.kW(i), cModel.fluid.srW(i));
+    kRg{i}=coreyPhaseRelpermAD(cModel.fluid.nG(i), cModel.fluid.srG(i), cModel.fluid.kG(i), cModel.fluid.srW(i));
+end
+
+cModel.fluid.krG=kRg;
+cModel.fluid.krW=kRw;
+
+%---(4) porevolume
+assert(size(pv,1)==size(cModel.operators.pv,1),'pv dimension mismatch')
+cModel.operators.pv = pv;
+
+% ---(5) wellIndex
+for i=1:length(wellName)
+
+    ind = find(strcmp({cPredSched.control.W.name}, wellName(i,:))==1);
+    cPredSched.control.W(ind).WI=wi(i);
+
+end
+
+%modify CG model class to generic BO model
+cModel = GenericBlackOilModel(cModel.G, cModel.rock,...
+    cModel.fluid, 'gas', true, 'water', true, 'oil', false);
+%% Simulate Model
+[~,states] = simulateScheduleAD(cState0, cModel, cFullSched);
+%% Plot Check
+%Compare Prediction and Reference Result
+% fh = plotWellSols(wellSols, ...
+%     cFullSched.step.val, ...
+%     'datasetnames', 'CGnet', 'zoom', false, ...
+%     'field', 'qWs');
+%% ############------------GENERATE OUTPUT---------------##################
+
+casename=erase(fname,".txt");
+
+% writer
+%
+% wellSols
+nWell=length(W); %include injector&monitor
+
+wellResult =zeros(1,(nWell*3+1)); %3:qGs, qWs, bhp +1 timestep
+
+for i=1:tRun
+    t=i;
+
+    qWs=vertcat(states{i}.wellSol(:).qWs);
+    qWs=transpose(qWs);
+
+    qGs=vertcat(states{i}.wellSol(:).qGs);
+    qGs=transpose(qGs);
+
+    bhp=vertcat(states{i}.wellSol(:).bhp);
+    bhp=transpose(bhp);
+
+    soltmp=[t qWs qGs bhp];
+    wellResult=[wellResult; soltmp];
+
+end
+
+wellResult(1,:)=[];
+
+nMap=cModel.G.cells.num;
+satgas=zeros(nMap,tRun);
+
+for i=1:tRun
+    satgas(:,i)=states{i}.s(:,2);
+end
+
+%delimiter : tab
+writematrix(satgas,['Sgas-',casename,'.txt'],'Delimiter','tab')
+
+%% naming results
+
+[qWsnm, qGsnm, bhpnm]=deal(cell(nWell,1));
+AllWname=vertcat(W.name);
+
+for i=1:nWell
+
+    qWsnm{i}=append('qwS-',AllWname(i,:));
+    qGsnm{i}=append('qgS-',AllWname(i,:));
+    bhpnm{i}=append('BHP-',AllWname(i,:));
+
+end
+
+varname=[{'time_yrs'} qWsnm' qGsnm' bhpnm'];
+
+Tresult=array2table(wellResult,"VariableNames",varname);
+writetable(Tresult,['wellResult-',casename,'.txt']);
+
+% casename=erase(fname,".txt");
+% outID=fopen(['out-',casename,'.txt'],'w');
+% fprintf(outID,'%d\n',data);
+% fclose(outID);
+
+
+    function currentDir=getcurrentdir()
+        if isdeployed %stand-alone mode
+            %[status, result] = system('path');
+            [~, result] = system('path');
+            currentDir = char(regexpi(result, 'Path=(.*?);','tokens','once'));
+        else
+            currentDir = pwd;
+        end
+    end
+
+
+
+
+end
